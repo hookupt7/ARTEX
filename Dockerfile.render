@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+# Slim single-container image for Render's free plan (512 MB RAM, no disk).
+# Builds the UI + Go binary from source; runs an in-container Postgres unless
+# ARTEX_PG_DSN points at an external database. No secrets are baked in: the
+# admin password and LLM key come from Render environment variables at runtime.
+
+FROM node:22-bookworm-slim AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY web/ ./
+RUN npm run build:static
+
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=web /src/web/out ./server/webui/dist
+RUN ARTEX_SKIP_FRONTEND=1 ARTEX_SKIP_NPM_CI=1 ARTEX_COMPRESS=0 \
+    ARTEX_OUTPUT=/out/artex ARTEX_BUILD_VERSION=render \
+    bash ./build.sh --target linux/amd64
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl jq git ripgrep postgresql-15 util-linux \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=build /out/artex /app/artex
+COPY skills/ /app/skills/
+COPY deploy/render/render-start.sh /app/render-start.sh
+RUN chmod +x /app/artex /app/render-start.sh && mkdir -p /app/data /app/keys
+ENV ARTEX_JWT_KEY_DIR=/app/keys
+EXPOSE 10000
+ENTRYPOINT ["/app/render-start.sh"]
